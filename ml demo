@@ -1,1 +1,97 @@
-print("Ml project demo")
+# -------------------------------
+# 1. Import Libraries
+# -------------------------------
+import boto3
+import pandas as pd
+from io import StringIO
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+import joblib
+import sagemaker
+from sagemaker.sklearn import SKLearn
+
+# -------------------------------
+# 2. AWS & S3 Setup
+# -------------------------------
+bucket_name = 'your-bucket-name'
+raw_file_key = 'data/raw_sales.csv'
+
+# boto3 client
+s3 = boto3.client('s3')
+
+# -------------------------------
+# 3. Pull Data from S3
+# -------------------------------
+obj = s3.get_object(Bucket=bucket_name, Key=raw_file_key)
+data = obj['Body'].read().decode('utf-8')
+df = pd.read_csv(StringIO(data))
+print("Raw Data Sample:\n", df.head())
+
+# -------------------------------
+# 4. Feature Engineering
+# -------------------------------
+# Example: create lag feature
+df['lag_1_sales'] = df.groupby('product_id')['sales'].shift(1).fillna(0)
+
+# Example: revenue
+df['revenue'] = df['sales'] * df['price']
+
+# Select features and target
+X = df[['lag_1_sales', 'revenue']]
+y = df['sales']
+
+# -------------------------------
+# 5. Train-Test Split
+# -------------------------------
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# -------------------------------
+# 6. Save Train/Test Data to S3 (Optional)
+# -------------------------------
+def upload_df_to_s3(df, key):
+    csv_buffer = StringIO()
+    df.to_csv(csv_buffer, index=False)
+    s3.put_object(Bucket=bucket_name, Key=key, Body=csv_buffer.getvalue())
+
+upload_df_to_s3(X_train, 'data/X_train.csv')
+upload_df_to_s3(X_test, 'data/X_test.csv')
+upload_df_to_s3(pd.DataFrame(y_train), 'data/y_train.csv')
+upload_df_to_s3(pd.DataFrame(y_test), 'data/y_test.csv')
+
+# -------------------------------
+# 7. Train Model Locally (Optional)
+# -------------------------------
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Save model locally
+joblib.dump(model, "rf_model.pkl")
+
+# -------------------------------
+# 8. Deploy Model in SageMaker
+# -------------------------------
+# Initialize SageMaker session
+sess = sagemaker.Session()
+role = "arn:aws:iam::123456789012:role/YourSageMakerRole"
+
+# Upload local model to S3 (needed by SageMaker)
+model_s3_path = sess.upload_data(path='rf_model.pkl', bucket=bucket_name, key_prefix='model')
+
+# Create a SageMaker SKLearn model
+sklearn_model = SKLearn(model_data=model_s3_path,
+                        role=role,
+                        entry_point='train.py',  # optional, for training script
+                        framework_version='0.23-1',
+                        sagemaker_session=sess)
+
+# Deploy as real-time endpoint
+predictor = sklearn_model.deploy(
+    initial_instance_count=1,
+    instance_type='ml.m4.xlarge'
+)
+
+# -------------------------------
+# 9. Make Predictions
+# -------------------------------
+preds = predictor.predict(X_test.values)
+print("Sample Predictions:", preds[:5])
